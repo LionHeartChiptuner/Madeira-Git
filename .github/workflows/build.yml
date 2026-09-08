@@ -1,0 +1,499 @@
+name: Build Madeira
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  MACOSX_DEPLOYMENT_TARGET: "17.0"
+
+jobs:
+  build:
+    name: Build Madeira
+    runs-on: macos-14
+
+    steps:
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+
+      - name: Checkout Madeira
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # ------------------------------------------------------------
+      # Xcode / Apple SDK
+      # ------------------------------------------------------------
+
+      - name: Show Xcode information
+        run: |
+          set -euxo pipefail
+
+          xcode-select -p
+          xcodebuild -version
+
+          echo "Available iPhoneOS SDKs:"
+          xcodebuild -showsdks | grep -i iphone || true
+
+          echo
+          echo "Selected SDK:"
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Accept Xcode license
+        run: |
+          sudo xcodebuild -license accept
+
+      # ------------------------------------------------------------
+      # Homebrew dependencies
+      # ------------------------------------------------------------
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+
+          brew install \
+            cmake \
+            ninja \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            nasm \
+            python
+
+      # ------------------------------------------------------------
+      # LLVM
+      #
+      # Madeira's native build scripts use LLVM tooling.  Apple's
+      # clang is retained as the Apple compiler; Homebrew LLVM is
+      # added to PATH for auxiliary LLVM utilities.
+      # ------------------------------------------------------------
+
+      - name: Install LLVM
+        run: |
+          set -euxo pipefail
+
+          brew install llvm
+
+          LLVM_PREFIX="$(brew --prefix llvm)"
+
+          echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
+
+          echo "LLVM:"
+          "$LLVM_PREFIX/bin/llvm-config" --version || true
+          "$LLVM_PREFIX/bin/llvm-objcopy" --version | head -n 1 || true
+
+      # ------------------------------------------------------------
+      # Verify repository
+      # ------------------------------------------------------------
+
+      - name: Verify submodules
+        run: |
+          set -euxo pipefail
+
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+          echo "Submodules:"
+          git submodule status --recursive
+
+      - name: Show repository layout
+        run: |
+          set -euxo pipefail
+
+          echo "Build scripts:"
+          find build -type f -name build.sh -print | sort
+
+          echo
+          echo "Top-level:"
+          find . -maxdepth 2 -type d \
+            ! -path './.git*' \
+            | sort | head -100
+
+      # ------------------------------------------------------------
+      # Prepare build directories
+      # ------------------------------------------------------------
+
+      - name: Prepare build environment
+        run: |
+          set -euxo pipefail
+
+          mkdir -p build-logs
+          mkdir -p app/build
+
+          chmod +x build/*/build.sh 2>/dev/null || true
+
+      # ------------------------------------------------------------
+      # Build native Madeira components
+      #
+      # Madeira's README specifies that build/*/build.sh contains
+      # the native build chains.
+      #
+      # We intentionally execute these in dependency-friendly
+      # groups rather than blindly running every script, because
+      # some directories contain tests/examples.
+      # ------------------------------------------------------------
+
+      - name: Build native components
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LOG="$GITHUB_WORKSPACE/build-logs/native-build.log"
+
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "=================================================="
+          echo "Madeira native build"
+          echo "=================================================="
+          echo
+
+          run_component() {
+            local component="$1"
+            local script="build/${component}/build.sh"
+
+            if [[ ! -f "$script" ]]; then
+              echo "::warning::No build script found for ${component}"
+              return 0
+            fi
+
+            echo
+            echo "=================================================="
+            echo "Building ${component}"
+            echo "=================================================="
+
+            chmod +x "$script"
+
+            (
+              cd "build/${component}"
+              ./build.sh
+            )
+          }
+
+          #
+          # Core Unix-side libraries
+          #
+
+          run_component crypto-unix
+          run_component gnutls-ios
+          run_component freetype-ios
+
+          #
+          # Wine Unix side
+          #
+
+          run_component ntdll-unix
+          run_component win32u-unix
+          run_component wineios-drv
+
+          #
+          # wineserver
+          #
+
+          run_component wineserver
+
+          #
+          # DXMT / Metal
+          #
+
+          run_component dxmt-ios
+
+          echo
+          echo "Native build stage finished."
+
+      # ------------------------------------------------------------
+      # Build any additional non-test build chains
+      #
+      # This catches components added by newer Madeira commits
+      # without automatically running obvious test projects.
+      # ------------------------------------------------------------
+
+      - name: Build remaining native components
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          LOG="$GITHUB_WORKSPACE/build-logs/remaining-build.log"
+
+          exec > >(tee -a "$LOG") 2>&1
+
+          declare -A BUILT
+
+          for component in \
+            crypto-unix \
+            gnutls-ios \
+            freetype-ios \
+            ntdll-unix \
+            win32u-unix \
+            wineios-drv \
+            wineserver \
+            dxmt-ios
+          do
+            BUILT["$component"]=1
+          done
+
+          while IFS= read -r script; do
+            component="$(basename "$(dirname "$script")")"
+
+            if [[ "${BUILT[$component]:-0}" == "1" ]]; then
+              continue
+            fi
+
+            case "$component" in
+              *test*|tests|x64-tests|proc-tests|net-tests)
+                echo "Skipping test component: $component"
+                continue
+                ;;
+              d3d11-triangle)
+                echo "Skipping example component: $component"
+                continue
+                ;;
+            esac
+
+            echo
+            echo "=================================================="
+            echo "Building additional component: $component"
+            echo "=================================================="
+
+            chmod +x "$script"
+
+            (
+              cd "$(dirname "$script")"
+              ./build.sh
+            )
+
+            BUILT["$component"]=1
+
+          done < <(find build -type f -name build.sh | sort)
+
+      # ------------------------------------------------------------
+      # Inspect generated libraries
+      # ------------------------------------------------------------
+
+      - name: Inspect native build output
+        run: |
+          set -euxo pipefail
+
+          echo "Static libraries:"
+          find . \
+            -type f \
+            \( -name '*.a' -o -name '*.dylib' \) \
+            -not -path './.git/*' \
+            -print \
+            | sort
+
+      # ------------------------------------------------------------
+      # Visual C++ runtime
+      #
+      # Madeira explicitly does NOT distribute Microsoft's VC++
+      # runtime DLLs. They must be supplied separately according
+      # to tools/fetch-vcruntime.md.
+      #
+      # We do not download Microsoft's binaries automatically here.
+      # ------------------------------------------------------------
+
+      - name: Check VC runtime instructions
+        run: |
+          set -e
+
+          if [[ -f tools/fetch-vcruntime.md ]]; then
+            echo "Madeira VC runtime instructions:"
+            cat tools/fetch-vcruntime.md
+          else
+            echo "::warning::tools/fetch-vcruntime.md was not found."
+          fi
+
+      # ------------------------------------------------------------
+      # Locate Xcode project
+      # ------------------------------------------------------------
+
+      - name: Locate Xcode project
+        id: xcode-project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          project=""
+
+          if compgen -G "app/*.xcworkspace" > /dev/null; then
+            project="$(find app -maxdepth 1 -name '*.xcworkspace' -print -quit)"
+            type="workspace"
+          elif compgen -G "app/*.xcodeproj" > /dev/null; then
+            project="$(find app -maxdepth 1 -name '*.xcodeproj' -print -quit)"
+            type="project"
+          else
+            echo "::error::No Xcode project/workspace found under app/"
+            exit 1
+          fi
+
+          echo "Project: $project"
+          echo "Type: $type"
+
+          echo "path=$project" >> "$GITHUB_OUTPUT"
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # List Xcode targets/schemes
+      # ------------------------------------------------------------
+
+      - name: List Xcode configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.xcode-project.outputs.path }}"
+          TYPE="${{ steps.xcode-project.outputs.type }}"
+
+          if [[ "$TYPE" == "workspace" ]]; then
+            xcodebuild \
+              -workspace "$PROJECT" \
+              -list
+          else
+            xcodebuild \
+              -project "$PROJECT" \
+              -list
+          fi
+
+      # ------------------------------------------------------------
+      # Build iOS application
+      #
+      # This is intentionally an unsigned device build.
+      #
+      # A GitHub-hosted runner does not have your Apple development
+      # certificate/provisioning profile, so this produces the
+      # compiled application rather than attempting to sign it
+      # for installation on a personal iPhone.
+      # ------------------------------------------------------------
+
+      - name: Build Madeira.app
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          PROJECT="${{ steps.xcode-project.outputs.path }}"
+          TYPE="${{ steps.xcode-project.outputs.type }}"
+
+          DERIVED_DATA="$GITHUB_WORKSPACE/DerivedData"
+
+          rm -rf "$DERIVED_DATA"
+          mkdir -p "$DERIVED_DATA"
+
+          if [[ "$TYPE" == "workspace" ]]; then
+
+            xcodebuild \
+              -workspace "$PROJECT" \
+              -sdk iphoneos \
+              -configuration Debug \
+              -derivedDataPath "$DERIVED_DATA" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              build
+
+          else
+
+            xcodebuild \
+              -project "$PROJECT" \
+              -sdk iphoneos \
+              -configuration Debug \
+              -derivedDataPath "$DERIVED_DATA" \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              build
+
+          fi
+
+      # ------------------------------------------------------------
+      # Find resulting .app
+      # ------------------------------------------------------------
+
+      - name: Locate Madeira.app
+        id: locate-app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(find DerivedData -type d -name 'Madeira.app' -print -quit || true)"
+
+          if [[ -z "$APP" ]]; then
+            echo "::error::Madeira.app was not produced."
+            echo
+            echo "Applications found:"
+            find DerivedData -type d -name '*.app' -print || true
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$APP"
+
+          echo "path=$APP" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------
+      # Package unsigned app
+      # ------------------------------------------------------------
+
+      - name: Package Madeira.app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="${{ steps.locate-app.outputs.path }}"
+
+          mkdir -p artifacts
+
+          cp -R "$APP" artifacts/Madeira.app
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            "$APP" \
+            artifacts/Madeira-app.zip
+
+      # ------------------------------------------------------------
+      # Upload build artifacts
+      # ------------------------------------------------------------
+
+      - name: Upload Madeira.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-iOS-app
+          path: artifacts/Madeira.app
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Madeira.app ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-iOS-app-zip
+          path: artifacts/Madeira-app.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      # ------------------------------------------------------------
+      # Upload logs even when build fails
+      # ------------------------------------------------------------
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-build-logs
+          path: |
+            build-logs/
+            DerivedData/**/*.log
+          if-no-files-found: warn
+          retention-days: 14
